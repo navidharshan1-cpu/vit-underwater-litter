@@ -1,204 +1,423 @@
-"""ViT Underwater Litter: classify underwater objects (trash / bio / rov) with a fine-tuned Vision Transformer.
+"""Police contact narrative classifier: a fine-tuned DeBERTa-v3-base that reads a Boston Police FIO narrative
+and predicts the circumstance of the contact (Stopped / Encountered / Observed).
 
-Streamlit app for the MAAI901 Applied Vision Transformer report. Run locally with:  streamlit run app.py
+Run locally with:  streamlit run app.py
 """
+import json
+import re
 import urllib.request
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image
 
 # ---------------------------------------------------------------- settings
-GITHUB_REPO = "navidharshan1-cpu/vit-underwater-litter"   # GitHub "username/repository"
-RELEASE_TAG = "v1.0"                                       # Release that holds the model file
-WEIGHTS = "vit_b16_trashcan_fp16.pt"
-BASE_MODEL = "google/vit-base-patch16-224"
+GITHUB_REPO = "navidharshan1-cpu/police-narrative-classifier"   # GitHub "username/repository"
+RELEASE_TAG = "v1.0"                                             # Release holding model.safetensors
+WEIGHTS = "model.safetensors"
+MODEL_FILES = ["config.json", "tokenizer.json", "tokenizer_config.json"]   # small files kept in the repository
 
 ROOT = Path(__file__).parent
-NAMES = ["trash", "bio", "rov"]
-LABELS = {"trash": "🗑️ Trash (litter)", "bio": "🐟 Bio (marine life)", "rov": "🤖 ROV (robot parts)"}
+LABELS = ["Stopped", "Encountered", "Observed"]
+ICONS = {"Stopped": "🛑", "Encountered": "💬", "Observed": "👁️"}
+MEANING = {
+    "Stopped": "The officer **stopped or detained** the person, e.g. a traffic stop or a subject stop.",
+    "Encountered": "The officer **interacted or spoke with** the person, without a formal stop.",
+    "Observed": "The officer **only observed** the person, without stopping or speaking to them.",
+}
 
-st.set_page_config(page_title="ViT Underwater Litter", page_icon="🔬", layout="wide")
+# Results from the notebook (used when metrics.json is not in the repository)
+DEFAULT = {
+    "accuracy": 0.815, "macro_f1": 0.748, "weighted_f1": 0.819, "macro_auc": 0.922,
+    "auc": {"Stopped": 0.937, "Encountered": 0.884, "Observed": 0.945},
+    "best_epoch": 4, "best_val_macro_f1": 0.763, "train_minutes": 8.8,
+}
+DATA = {"rows": 4860, "narratives": 4618, "counts": {"Stopped": 2917, "Encountered": 1075, "Observed": 626},
+        "split": {"Train": 3232, "Validation": 693, "Test": 693}, "median_tokens": 152, "truncated": "1.0%"}
+
+st.set_page_config(page_title="Police Narrative Classifier", page_icon="🚔", layout="wide")
 
 
-def find_file(name):
-    for p in (ROOT / name, ROOT / "results" / name, ROOT / "models" / name):
+def find(name):
+    for p in (ROOT / name, ROOT / "model" / name, ROOT / "results" / name, ROOT / "figures" / name):
         if p.exists():
             return p
     return None
+
+
+def show_fig(name, caption):
+    p = find(name)
+    if p:
+        st.image(str(p), caption=caption, use_container_width=True)
+    return p is not None
+
+
+def clean(text):
+    """Same cleaning as in training: redaction marks -> [REDACTED], officer names -> [NAME]."""
+    t = str(text)
+    t = re.sub(r'X{2,}(?:/X{2,})*', ' [REDACTED] ', t)
+    title = r"(?:Officers?|Ofc\.?|P\.?O\.?|Sgt\.?|Sergeant|Det\.?|Detective|Lt\.?|Lieutenant|Trooper|Capt\.?|Captain)"
+    name = r"(?!(?:and|of|the|in|on|at)\b)[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+)?"
+    for _ in range(2):
+        t = re.sub(rf"\b({title})\s+(?!\[NAME\]){name}(\s+(?:and|&)\s+(?!{title}\b){name})?", r'\1 [NAME]', t)
+    t = re.sub(r'(\[REDACTED\]\s*){2,}', '[REDACTED] ', t)
+    return re.sub(r'\s+', ' ', t).strip()
 
 
 # ---------------------------------------------------------------- model
 @st.cache_resource(show_spinner=False)
 def load_model():
     import torch
-    from transformers import ViTConfig, ViTForImageClassification
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-    path = find_file(WEIGHTS)
-    if path is None:
-        path = ROOT / WEIGHTS
-        url = f"https://github.com/{GITHUB_REPO}/releases/download/{RELEASE_TAG}/{WEIGHTS}"
-        tmp = path.with_suffix(".part")
-        urllib.request.urlretrieve(url, tmp)
-        tmp.rename(path)
+    model_dir = ROOT / "model_files"
+    model_dir.mkdir(exist_ok=True)
+    for f in MODEL_FILES:
+        src = find(f)
+        if src is None:
+            raise FileNotFoundError(f"{f} is missing from the repository.")
+        (model_dir / f).write_bytes(src.read_bytes())
+    weights = find(WEIGHTS)
+    if weights is None:
+        weights = model_dir / WEIGHTS
+        if not weights.exists():
+            tmp = weights.with_suffix(".part")
+            urllib.request.urlretrieve(
+                f"https://github.com/{GITHUB_REPO}/releases/download/{RELEASE_TAG}/{WEIGHTS}", tmp)
+            tmp.rename(weights)
+    elif weights.parent != model_dir:
+        (model_dir / WEIGHTS).write_bytes(weights.read_bytes())
 
-    config = ViTConfig.from_pretrained(BASE_MODEL, num_labels=len(NAMES), id2label=dict(enumerate(NAMES)),
-                                       label2id={n: i for i, n in enumerate(NAMES)})
-    model = ViTForImageClassification(config)
-    try:
-        model.set_attn_implementation("eager")      # needed to read the attention maps
-    except Exception:
-        try:
-            model.config._attn_implementation = "eager"
-        except Exception:
-            pass                                   # app still works; the attention map is then skipped
-    state = torch.load(path, map_location="cpu")
-    model.load_state_dict({k: v.float() if v.is_floating_point() else v for k, v in state.items()})
-    model.eval()
+    tok = AutoTokenizer.from_pretrained(model_dir)
+    model = AutoModelForSequenceClassification.from_pretrained(model_dir).float().eval()
     torch.set_num_threads(2)
-    return model
+    return tok, model
 
 
-def preprocess(img):
-    import torch
-    x = np.asarray(img.convert("RGB").resize((224, 224), Image.BILINEAR), dtype=np.float32) / 255.0
-    x = (x - 0.5) / 0.5
-    return torch.from_numpy(x).permute(2, 0, 1)[None]
+def get_model():
+    with st.spinner("Loading the model (first time only, about a minute)..."):
+        return load_model()
 
 
-def classify(model, img):
-    """Returns class probabilities and the attention-rollout map (14 x 14, 0..1)."""
+def predict(tok, model, texts):
     import torch
     with torch.no_grad():
-        out = model(pixel_values=preprocess(img), output_attentions=True)
-    probs = out.logits.softmax(-1)[0].numpy()
-    heat = None
-    if out.attentions and out.attentions[0] is not None:
-        att = torch.stack(out.attentions).squeeze(1).mean(1)      # layers x tokens x tokens, heads averaged
-        att = att + torch.eye(att.size(-1))
-        att = att / att.sum(-1, keepdim=True)
-        R = att[0]
-        for a in att[1:]:
-            R = a @ R
-        heat = R[0, 1:].reshape(14, 14).numpy()
-        heat = heat / heat.max()
-    return probs, heat
+        enc = tok(texts, truncation=True, max_length=512, padding=True, return_tensors="pt")
+        return model(**enc).logits.float().softmax(-1).numpy()
 
 
-def overlay(img, heat, alpha=0.45):
-    import matplotlib.cm as cm
-    base = img.convert("RGB").resize((448, 448))
-    h = Image.fromarray(np.uint8(heat * 255)).resize((448, 448), Image.BICUBIC)
-    colored = Image.fromarray(np.uint8(cm.jet(np.asarray(h) / 255.0)[..., :3] * 255))
-    return Image.blend(base, colored, alpha)
+def word_importance(tok, model, text, k, max_words=120):
+    words = text.split()[:max_words]
+    base = predict(tok, model, [" ".join(words)])[0, k]
+    drops = []
+    variants = [" ".join(words[:i] + words[i + 1:]) for i in range(len(words))]
+    for i in range(0, len(variants), 16):
+        drops.extend(base - predict(tok, model, variants[i:i + 16])[:, k])
+    return words, np.array(drops)
+
+
+def highlight(words, drops):
+    top = max(drops.max(), 1e-6)
+    out = []
+    for w, d in zip(words, drops):
+        a = max(0.0, d) / top
+        out.append(f'<span style="background: rgba(232,131,58,{a:.2f}); padding: 1px 2px; border-radius: 3px">{w}</span>'
+                   if a > 0.15 else w)
+    return " ".join(out)
+
+
+# ---------------------------------------------------------------- results
+@st.cache_data
+def load_results():
+    f = find("test_results.csv")
+    if f is None:
+        return None
+    r = pd.read_csv(f, index_col=0)
+    r.index = r.index.astype(str).str.strip()
+    return r
 
 
 @st.cache_data
-def load_results():
-    f = find_file("test_results.csv")
-    return pd.read_csv(f, index_col=0) if f else None
+def load_metrics():
+    m = dict(DEFAULT)
+    f = find("metrics.json")
+    if f:
+        try:
+            j = json.loads(f.read_text())
+            for k in ("accuracy", "macro_f1", "weighted_f1", "macro_auc"):
+                if isinstance(j.get(k), (int, float)):
+                    m[k] = float(j[k])
+        except Exception:
+            pass
+    return m
 
 
-def samples():
-    files = sorted(set(ROOT.glob("sample__*.jpg")) | set((ROOT / "samples").glob("sample__*.jpg")))
-    return {f"{f.name.split('__')[1]} · {f.name.split('__', 2)[2]}": f for f in files}
+def headline(r):
+    def num(row, col):
+        try:
+            return float(r.loc[row, col])
+        except (KeyError, ValueError, TypeError):
+            return None
+    return {"accuracy": num("accuracy", "F1"), "macro_f1": num("macro average", "F1"),
+            "per_class": {l: {c: num(l, c) for c in ("precision", "recall", "F1")} for l in LABELS if l in r.index},
+            "support": {l: num(l, r.columns[-1]) for l in LABELS if l in r.index}}
 
 
-# ---------------------------------------------------------------- page
-st.title("🔬 ViT Underwater Litter")
-st.markdown("A **Vision Transformer (ViT-B/16)**, fine-tuned on object crops from the "
-            "[TrashCan 1.0](https://conservancy.umn.edu/handle/11299/214865) deep-sea ROV dataset, "
-            "classifies an underwater object as **trash**, **bio** (marine life) or **rov** (the robot's own parts).")
+@st.cache_data
+def load_examples():
+    f = find("examples.csv")
+    return pd.read_csv(f) if f else None
 
-tab_cls, tab_perf, tab_about = st.tabs(["🔍 Classify", "📊 Model performance", "ℹ️ About"])
+
 results = load_results()
+H = headline(results) if results is not None else None
+M = load_metrics()
+ACC = H["accuracy"] if H and H["accuracy"] is not None else M["accuracy"]
+MF1 = H["macro_f1"] if H and H["macro_f1"] is not None else M["macro_f1"]
 
-with st.sidebar:
-    st.header("Image")
-    src = st.radio("Source", ["Upload an image", "Example test image (true class known)"])
-    st.caption("The model classifies **one object**. For a whole scene, use the crop sliders to frame one object.")
 
-with tab_cls:
-    img, truth, name = None, None, None
-    if src == "Upload an image":
-        up = st.file_uploader("Underwater image", type=["jpg", "jpeg", "png", "webp"])
-        if up is not None:
-            img, name = Image.open(up), up.name
-    else:
-        ex = samples()
-        if ex:
-            key = st.selectbox("Example test image", list(ex))
-            img, name, truth = Image.open(ex[key]), ex[key].name, key.split(" · ")[0]
+def show_prediction(probs, truth=None):
+    k = int(probs.argmax())
+    left, right = st.columns([1, 1.3])
+    with left:
+        st.subheader(f"{ICONS[LABELS[k]]} {LABELS[k]}")
+        st.metric("Confidence", f"{probs[k]:.1%}")
+        st.caption(MEANING[LABELS[k]].replace("**", ""))
+    with right:
+        for i, l in enumerate(LABELS):
+            st.progress(float(probs[i]), text=f"{ICONS[l]} {l}: {probs[i]:.1%}")
+    with st.container(border=True):
+        if truth is not None:
+            st.markdown(f"**Accuracy on this narrative:** true circumstance **{truth}**, predicted **{LABELS[k]}**: "
+                        + ("✅ correct" if truth == LABELS[k] else "❌ incorrect"))
         else:
-            st.warning("No example images (sample__*.jpg) found in the repository.")
+            st.markdown("**Accuracy on this narrative:** not measurable (no true label for new text)")
+        pc = H["per_class"].get(LABELS[k], {}) if H else {}
+        st.markdown(f"**Model accuracy on 693 unseen test narratives:** accuracy **{ACC:.1%}** · macro F1 **{MF1:.1%}**"
+                    + (f"  \nFor **{LABELS[k]}** predictions: precision {pc.get('precision', 0):.1%} · "
+                       f"recall {pc.get('recall', 0):.1%} · F1 {pc.get('F1', 0):.1%}" if pc else ""))
+        if probs[k] < 0.6:
+            st.warning("Low confidence: the narrative fits more than one circumstance. Treat this prediction with care.")
+    return k
 
-    if img is None:
-        st.info("Upload an underwater image, or choose an example test image in the sidebar.")
+
+# ---------------------------------------------------------------- sidebar navigation
+PAGES = ["Overview Dashboard", "Live Narrative Analysis", "Example Narrative Gallery", "Model Performance",
+         "Project & Workflow", "Dataset & Preprocessing", "Use Cases & Impact", "About & Limitations"]
+with st.sidebar:
+    st.markdown("## 🚔 Police Narrative Classifier")
+    st.caption("Fine-tuned DeBERTa-v3-base · NLP")
+    page = st.radio("Navigation", PAGES, label_visibility="collapsed")
+    st.divider()
+    st.metric("Test accuracy", f"{ACC:.1%}")
+    st.metric("Macro F1", f"{MF1:.1%}")
+    st.caption("Classifies a police contact narrative as **Stopped**, **Encountered** or **Observed**.")
+
+
+# ================================================================ pages
+if page == "Overview Dashboard":
+    st.title("🚔 Police Contact Narrative Classifier")
+    st.markdown(
+        "A fine-tuned **DeBERTa-v3-base** transformer reads the free-text narrative an officer wrote about a "
+        "Boston Police **Field Interrogation and Observation (FIO)** contact and classifies the **circumstance** of the contact.")
+    c1, c2, c3 = st.columns(3)
+    for col, l in zip((c1, c2, c3), LABELS):
+        col.info(f"**{ICONS[l]} {l}**  \n{MEANING[l]}")
+
+    st.subheader("Key results (held-out test set)")
+    m = st.columns(4)
+    m[0].metric("Accuracy", f"{ACC:.1%}")
+    m[1].metric("Macro F1", f"{MF1:.1%}")
+    m[2].metric("Weighted F1", f"{M['weighted_f1']:.1%}")
+    m[3].metric("Macro ROC-AUC", f"{M['macro_auc']:.3f}")
+    m = st.columns(4)
+    m[0].metric("Narratives", f"{DATA['narratives']:,}")
+    m[1].metric("Test narratives", "693")
+    m[2].metric("Parameters", "184 M")
+    m[3].metric("Training time", f"{M['train_minutes']} min (T4 GPU)")
+
+    st.subheader("F1 score per circumstance")
+    if H:
+        st.bar_chart(pd.DataFrame({"F1": {l: v["F1"] for l, v in H["per_class"].items()}}), horizontal=True)
+    st.markdown("➡️ Use **Live Narrative Analysis** in the sidebar to classify your own narrative.")
+
+elif page == "Live Narrative Analysis":
+    st.title("🔍 Live Narrative Analysis")
+    st.markdown("Write or paste an FIO-style narrative. The model predicts the circumstance and its confidence.")
+    text = st.text_area("Narrative", height=170, placeholder=(
+        "e.g. Officers conducted a traffic stop on a black Honda Accord for an expired inspection sticker. "
+        "The operator was calm and cordial. Verbal warning issued."))
+    explain = st.checkbox("Show which words influenced the prediction (slower, ~10-30 s)")
+    if st.button("Classify", type="primary", disabled=not text.strip()):
+        tok, model = get_model()
+        cleaned = clean(text)
+        probs = predict(tok, model, [cleaned])[0]
+        k = show_prediction(probs)
+        if cleaned != text.strip():
+            with st.expander("Text after cleaning (as the model sees it)"):
+                st.write(cleaned)
+        if explain:
+            with st.spinner("Measuring word importance..."):
+                words, drops = word_importance(tok, model, cleaned, k)
+            st.markdown("**Words that pushed the model towards this prediction** (darker = more influence):")
+            st.markdown(highlight(words, drops), unsafe_allow_html=True)
+            if len(cleaned.split()) > len(words):
+                st.caption(f"Only the first {len(words)} words are analysed.")
+
+elif page == "Example Narrative Gallery":
+    st.title("🗂️ Example Narrative Gallery")
+    st.markdown("Real narratives from the **test set** (never seen in training). The true circumstance is known, "
+                "so you can check whether the model is right.")
+    examples = load_examples()
+    if examples is None or not len(examples):
+        st.warning("examples.csv not found in the repository.")
     else:
-        img = img.convert("RGB")
-        W, H = img.size
-        with st.expander("✂️ Crop to one object (optional)"):
-            c1, c2 = st.columns(2)
-            x0, x1 = c1.slider("Left / right (%)", 0, 100, (0, 100))
-            y0, y1 = c2.slider("Top / bottom (%)", 0, 100, (0, 100))
-        if x1 - x0 >= 5 and y1 - y0 >= 5:
-            img = img.crop((int(W * x0 / 100), int(H * y0 / 100), int(W * x1 / 100), int(H * y1 / 100)))
+        if st.button("▶️ Classify all examples", type="primary"):
+            tok, model = get_model()
+            probs = predict(tok, model, [clean(t) for t in examples.text.astype(str)])
+            st.session_state["gallery"] = probs
+        probs = st.session_state.get("gallery")
+        if probs is not None and len(probs) == len(examples):
+            preds = [LABELS[int(p.argmax())] for p in probs]
+            correct = sum(p == t for p, t in zip(preds, examples.circumstance))
+            st.success(f"Accuracy on these {len(examples)} examples: **{correct}/{len(examples)} "
+                       f"({correct / len(examples):.0%})**")
+        for l in LABELS:
+            sub = examples[examples.circumstance == l]
+            if not len(sub):
+                continue
+            st.subheader(f"{ICONS[l]} True circumstance: {l}")
+            for i, r in sub.iterrows():
+                with st.container(border=True):
+                    st.write(str(r.text))
+                    if probs is not None and len(probs) == len(examples):
+                        p = probs[i]
+                        k = int(p.argmax())
+                        ok = LABELS[k] == l
+                        st.markdown(f"**Predicted:** {ICONS[LABELS[k]]} {LABELS[k]} ({p[k]:.1%}) "
+                                    + ("✅ correct" if ok else "❌ incorrect"))
 
-        with st.spinner("Loading the ViT (first time only, about a minute)..."):
-            model = load_model()
-        probs, heat = classify(model, img)
-        k = int(probs.argmax())
-
-        left, mid, right = st.columns([1, 1, 1.2])
-        left.image(img, caption="Input object", use_container_width=True)
-        if heat is not None:
-            mid.image(overlay(img, heat), caption="Attention rollout: where the ViT looks (red = most attention)",
-                      use_container_width=True)
-        with right:
-            st.subheader(f"Prediction: {LABELS[NAMES[k]]}")
-            st.metric("Confidence", f"{probs[k]:.1%}")
-            for i, c in enumerate(NAMES):
-                st.progress(float(probs[i]), text=f"{LABELS[c]}: {probs[i]:.1%}")
-
-        with st.container(border=True):
-            if truth is not None:
-                ok = truth == NAMES[k]
-                st.markdown(f"**Accuracy on this image:** true class **{truth}**, predicted **{NAMES[k]}**: "
-                            + ("✅ correct" if ok else "❌ incorrect"))
-            else:
-                st.markdown("**Accuracy on this image:** not measurable (no true label for an uploaded photo)")
-            if results is not None and "ViT fine-tuned" in results.index:
-                r = results.loc["ViT fine-tuned"]
-                per = " · ".join(f"{c} F1 {r[f'{c} F1']:.1%}" for c in NAMES if f"{c} F1" in r)
-                st.markdown(f"**Model accuracy on the test set:** accuracy **{r['accuracy']:.1%}** · "
-                            f"macro F1 **{r['macro F1']:.1%}**  \n{per}")
-
-with tab_perf:
-    st.subheader("Test-set results")
-    st.caption("Objects from deep-sea videos that were never used for training or model selection.")
-    if results is not None:
-        cols = [c for c in ["accuracy", "macro F1"] + [f"{c} F1" for c in NAMES] if c in results.columns]
-        st.dataframe(results[cols].round(3), use_container_width=True)
-        if "ViT fine-tuned" in results.index:
-            r = results.loc["ViT fine-tuned"]
-            m1, m2 = st.columns(2)
-            m1.metric("ViT fine-tuned: accuracy", f"{r['accuracy']:.1%}")
-            m2.metric("ViT fine-tuned: macro F1", f"{r['macro F1']:.1%}")
+elif page == "Model Performance":
+    st.title("📊 Model Performance")
+    st.caption("Held-out test set: 693 narratives (15% of the data) never used for training or model selection.")
+    m = st.columns(4)
+    m[0].metric("Accuracy", f"{ACC:.1%}")
+    m[1].metric("Macro F1", f"{MF1:.1%}")
+    m[2].metric("Weighted F1", f"{M['weighted_f1']:.1%}")
+    m[3].metric("Macro ROC-AUC", f"{M['macro_auc']:.3f}")
+    if H:
+        rows = [{"Circumstance": f"{ICONS[l]} {l}", "Precision": v["precision"], "Recall": v["recall"], "F1": v["F1"],
+                 "ROC-AUC": M["auc"].get(l), "Test narratives": int(H["support"][l] or 0)}
+                for l, v in H["per_class"].items()]
+        st.dataframe(pd.DataFrame(rows).set_index("Circumstance").style.format(
+            {"Precision": "{:.1%}", "Recall": "{:.1%}", "F1": "{:.1%}", "ROC-AUC": "{:.3f}"}), use_container_width=True)
     else:
         st.warning("test_results.csv not found in the repository.")
+    st.markdown("- **Stopped** is recognised most reliably: its narratives use distinctive language "
+                "(\"traffic stop\", \"T/S\", \"operator\").\n"
+                "- **Encountered** and **Observed** are harder: many narratives of every type say \"officers observed…\", "
+                "so these circumstances overlap in wording. Most confident mistakes are Encountered narratives "
+                "predicted as Observed or Stopped.\n"
+                f"- Best checkpoint: epoch {M['best_epoch']} (validation macro F1 {M['best_val_macro_f1']:.3f}).")
+    figs = [("fig3_confusion_matrix.png", "Confusion matrix"), ("fig3b_per_class_scores.png", "Per-class scores"),
+            ("fig3c_roc_pr_curves.png", "ROC and precision-recall curves"), ("fig3d_confidence.png", "Confidence of predictions"),
+            ("fig2_training_curves.png", "Training curves"), ("fig4_bias_analysis.png", "Accuracy by subgroup"),
+            ("fig5_word_importance.png", "Most influential words")]
+    shown = [f for f in figs if find(f[0])]
+    for i in range(0, len(shown), 2):
+        cols = st.columns(2)
+        for col, (f, cap) in zip(cols, shown[i:i + 2]):
+            with col:
+                show_fig(f, cap)
 
-with tab_about:
+elif page == "Project & Workflow":
+    st.title("🧭 Project & Workflow")
     st.markdown("""
-- **Model:** ViT-B/16 (Dosovitskiy et al., 2021), ImageNet pre-trained, all layers fine-tuned (AdamW, lr 3e-5,
-  5 epochs, class-weighted loss). Images are split into 16 × 16 patches and processed by 12 transformer layers.
-- **Data:** TrashCan 1.0 (Hong, Fulton & Sattar, 2020). Every labelled object is cut out and labelled
-  trash / bio / rov. Whole **videos** are kept in one split, so test objects come from unseen dives.
-- **Attention map:** attention rollout (Abnar & Zuidema, 2020) shows which image patches the model relied on.
-- **Limits:** trained only on deep-sea ROV footage (mostly the Sea of Japan); bright shallow water, other cameras
-  or objects not in the three classes can give confident but wrong answers. The model classifies one object at a
-  time and does not locate objects in a scene.
+**Goal:** fine-tune one well-chosen transformer to classify the circumstance of a police contact from the officer's narrative.
 
-*MAAI901 Deep Learning for Visual Data, University of Wollongong in Dubai.*
+**Why DeBERTa-v3-base?** It improves on BERT/RoBERTa with *disentangled attention* (content and position are encoded
+separately) and an enhanced mask decoder, and it is among the strongest base-size encoders for text classification.
+It reads up to 512 tokens, which covers 99% of the narratives, and fine-tunes in under 10 minutes on a free T4 GPU.
 """)
+    steps = [
+        ("1. Load data", "Boston Police FIO 2024 CSV (4,860 rows)."),
+        ("2. Clean", "Remove duplicate rows of multi-person contacts, mark redactions as [REDACTED], mask officer names as [NAME]."),
+        ("3. Split", "Stratified 70 / 15 / 15: train 3,232 · validation 693 · test 693."),
+        ("4. Tokenise", "DeBERTa-v3 tokenizer, max 512 tokens, dynamic padding."),
+        ("5. Fine-tune", "AdamW lr 2e-5, 10% warm-up + linear decay, batch 8 × 2 accumulation, 4 epochs, mixed precision, class-weighted cross-entropy."),
+        ("6. Select", "Keep the epoch with the best validation macro F1."),
+        ("7. Evaluate", "Test accuracy, precision/recall/F1, confusion matrix, ROC/PR curves, confidence, subgroup analysis."),
+        ("8. Explain", "Occlusion word importance: remove each word and measure the drop in probability."),
+        ("9. Deploy", "Weights on GitHub Releases, this Streamlit app on Streamlit Community Cloud."),
+    ]
+    for t, d in steps:
+        with st.container(border=True):
+            st.markdown(f"**{t}** · {d}")
+    show_fig("fig2_training_curves.png", "Training and validation curves")
+
+elif page == "Dataset & Preprocessing":
+    st.title("📁 Dataset & Preprocessing")
+    st.markdown("**Source:** Boston Police Department *Field Interrogation and Observation (FIO)* records, 2024 "
+                "(Analyze Boston open data). Each record contains the officer's free-text narrative and the recorded circumstance.")
+    m = st.columns(4)
+    m[0].metric("Rows in CSV", f"{DATA['rows']:,}")
+    m[1].metric("Unique narratives", f"{DATA['narratives']:,}")
+    m[2].metric("Median length", f"{DATA['median_tokens']} tokens")
+    m[3].metric("Truncated at 512", DATA["truncated"])
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Class distribution**")
+        counts = pd.DataFrame({"Narratives": DATA["counts"]})
+        st.bar_chart(counts)
+        st.caption("Stopped is 63% of the data, so the loss is class-weighted and macro F1 is the main metric.")
+    with c2:
+        st.markdown("**Data split (stratified)**")
+        st.dataframe(pd.DataFrame({"Narratives": DATA["split"]}), use_container_width=True)
+    st.markdown("""
+**Preprocessing**
+- **De-duplication:** a contact with several people appears as several rows with the same narrative; keeping one per
+  contact number (`fc_num`) prevents the same text appearing in both training and test.
+- **Redactions:** runs of `XXX` in the source are replaced by `[REDACTED]`.
+- **Officer names:** names after titles (Officer, Sgt., Det., …) are replaced by `[NAME]`, so the model learns
+  wording rather than who wrote the report.
+- **No data augmentation** was used: the narratives are real records, and paraphrasing could change the circumstance.
+""")
+    show_fig("fig1_data.png", "Class distribution and narrative lengths")
+    show_fig("fig1b_token_lengths.png", "Token lengths")
+
+elif page == "Use Cases & Impact":
+    st.title("🌍 Use Cases & Impact")
+    st.markdown("""
+**Where a model like this can help (research and oversight, not decisions about people):**
+- **Data-quality checks:** flag records whose narrative does not match the recorded circumstance, so analysts can review them.
+- **Transparency and accountability research:** label large archives of narratives consistently to study how stops,
+  encounters and observations are recorded over time.
+- **Analyst support:** sort and search thousands of free-text reports faster than reading them by hand.
+- **Teaching:** a worked example of fine-tuning a transformer on real, sensitive public-sector text.
+
+**Impact**
+- Automates a reading task that takes a person minutes per report, in under a second.
+- The confidence score and word highlighting show *why* a prediction was made, supporting human review.
+""")
+    st.warning("This model must **not** be used to make or justify decisions about individuals, policing actions or legal outcomes.")
+
+elif page == "About & Limitations":
+    st.title("ℹ️ About & Limitations")
+    st.markdown(f"""
+**Model:** `microsoft/deberta-v3-base` (184 M parameters), fine-tuned end-to-end on 3,232 narratives
+(AdamW lr 2e-5, class-weighted cross-entropy, max 512 tokens). Best checkpoint by validation macro F1.
+
+**Test results:** accuracy {ACC:.1%} · macro F1 {MF1:.1%} · macro ROC-AUC {M['macro_auc']:.3f}.
+
+**Limitations**
+- The label is the circumstance **recorded by the officer**; the model learns how officers write, not what happened.
+- **Encountered** and **Observed** overlap in wording, so they are confused more often than Stopped.
+- Accuracy differs between subgroups (e.g. 68% for contacts with basis *Encounter* vs 90% for *Probable Cause*).
+- Trained on one city and one year; other departments or later years may use different language.
+- The model can be confidently wrong. It is a research and education tool.
+
+**Responsible use:** narratives contain sensitive information. Names were redacted in the source data and officer
+names are masked before classification. Text typed into this app is not stored.
+""")
+    st.caption("NLP project · University of Wollongong in Dubai")
